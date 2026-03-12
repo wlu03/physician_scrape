@@ -89,53 +89,30 @@ def parse_npi_record(record: dict) -> dict:
 def scrape_healthgrades(full_name: str) -> dict:
     """
     Scrape Healthgrades profile page for a physician.
-    TEMPLATE — inspect the live page and update selectors accordingly.
+
+    NOTE: Healthgrades is a fully JavaScript-rendered (React) site.
+    requests + BeautifulSoup only receives the raw JS bundle — no doctor
+    data is present in the initial HTML response.  To make this work you
+    need a headless browser such as Selenium or Playwright, e.g.:
+
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto(search_url)
+            page.wait_for_selector("a.provider-name-link")
+            html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
+
+    Until browser automation is added, this function returns empty fields.
     """
-    # search page
-    search_url = f"https://www.healthgrades.com/usearch?what={full_name.replace(' ', '+')}"
-    result = {
+    return {
         "hg_url":            None,
         "hg_rating":         None,
         "hg_review_count":   None,
         "hg_education":      None,
         "hg_hospital_affil": None,
     }
-    try:
-        resp = requests.get(search_url, headers=HEADERS, timeout=12)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # update these CSS selectors after inspecting the live page 
-        first_result = soup.select_one("a.provider-name-link")   # example selector
-        if not first_result:
-            return result
-
-        profile_path = first_result.get("href", "")
-        profile_url  = "https://www.healthgrades.com" + profile_path
-        result["hg_url"] = profile_url
-
-        time.sleep(REQUEST_DELAY)
-        profile_resp = requests.get(profile_url, headers=HEADERS, timeout=12)
-        profile_resp.raise_for_status()
-        profile_soup = BeautifulSoup(profile_resp.text, "html.parser")
-
-        # update these selectors to match actual page structure
-        rating_tag   = profile_soup.select_one("[data-testid='rating-value']")
-        reviews_tag  = profile_soup.select_one("[data-testid='review-count']")
-        edu_tag      = profile_soup.select_one(".education-training-item")
-        hospital_tag = profile_soup.select_one(".hospital-affiliation-name")
-
-        result["hg_rating"] = rating_tag.get_text(strip=True)   if rating_tag   else None
-        result["hg_review_count"]  = reviews_tag.get_text(strip=True)  if reviews_tag  else None
-        result["hg_education"] = edu_tag.get_text(strip=True)      if edu_tag      else None
-        result["hg_hospital_affil"] = hospital_tag.get_text(strip=True) if hospital_tag else None
-
-    except requests.RequestException as exc:
-        log.warning("Healthgrades error for %s: %s", full_name, exc)
-    except Exception as exc:
-        log.warning("Healthgrades parse error for %s: %s", full_name, exc)
-
-    return result
 
 
 # STUB for additional website
@@ -152,6 +129,27 @@ def scrape_site_b(full_name: str) -> dict:
 
 
 # Orchestrator
+def _name_matches(record: dict, first: str, last: str) -> bool:
+    """Return True if the NPI record's name matches the queried first/last name."""
+    basic = record.get("basic", {})
+    rec_first = (basic.get("first_name") or "").lower()
+    rec_last  = (basic.get("last_name")  or "").lower()
+    return rec_first == first.lower() and rec_last == last.lower()
+
+
+def _pick_best_npi(records: list[dict], first: str, last: str) -> tuple[dict, str]:
+    """
+    Return (best_record, note).
+    Prefers exact name matches; falls back to first result with a warning.
+    """
+    exact = [r for r in records if _name_matches(r, first, last)]
+    if exact:
+        note = f"{len(exact)} exact NPI match(es) found" if len(exact) > 1 else ""
+        return exact[0], note
+    # No exact match — the API returned phonetic/partial results
+    return records[0], "No exact name match in NPI results — top result used, review manually"
+
+
 def process_physician(full_name: str, scrape_web: bool = True) -> dict:
     """
     Given a physician's full name, collect all available data and return
@@ -168,11 +166,11 @@ def process_physician(full_name: str, scrape_web: bool = True) -> dict:
     # NPI Registry
     npi_records = query_npi_registry(first, last)
     if npi_records:
-        best = npi_records[0]   # take top match, could rank further if needed
+        best, note = _pick_best_npi(npi_records, first, last)
         row.update(parse_npi_record(best))
-        if len(npi_records) > 1:
-            row["npi_match_count"] = len(npi_records)
-            row["npi_note"] = "Multiple NPI matches found — review manually"
+        row["npi_match_count"] = len(npi_records)
+        if note:
+            row["npi_note"] = note
     else:
         row["npi_note"] = "No NPI record found"
 
